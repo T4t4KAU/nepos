@@ -130,7 +130,7 @@ SECTIONS
 
 编译后的文件还不能直接提交给QEMU，该文件中还保留了一些元数据，必须将该元数据移除，才能从QEMU启动。执行如下命令，使用QEMU启动内核：
 
-```powershell
+```
 # run.sh
 
 cargo build --release # 编译
