@@ -5,16 +5,15 @@ pub struct TrapContext {
     /// general regs[0..31]
     pub x: [usize; 32],
     /// CSR sstatus      
-    pub sstatus: Sstatus, // 标识特权状态
+    pub sstatus: Sstatus,
     /// CSR sepc
-    pub sepc: usize, // 记录返回地址
+    pub sepc: usize,
 }
 
-// 陷入内核态时 保存上下文
 impl TrapContext {
     /// set stack pointer to x_2 reg (sp)
     pub fn set_sp(&mut self, sp: usize) {
-        self.x[2] = sp; // 修改栈顶指针
+        self.x[2] = sp;
     }
     /// init app context
     pub fn app_init_context(entry: usize, sp: usize) -> Self {

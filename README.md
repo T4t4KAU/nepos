@@ -130,7 +130,7 @@ SECTIONS
 
 编译后的文件还不能直接提交给QEMU，该文件中还保留了一些元数据，必须将该元数据移除，才能从QEMU启动。执行如下命令，使用QEMU启动内核：
 
-```powershell
+```
 # run.sh
 
 cargo build --release # 编译
@@ -276,3 +276,161 @@ pub struct TrapContext {
 1. 调用  `ecall` 指令，开始系统调用
 2. 陷入内核态，修改SPP为当前特权级，保存系统调用结束后应该返回的地址
 3. CPU跳转到 trap 处理入口地址，修改当前特权级别为S
+4. 执行系统调用
+5. 返回用户态
+
+## CH3-多道程序设计
+
+显而易见，单道批处理系统有一个弊端，当程序需要访问外设时，那么CPU就要等待该程序访问外设的这段时间，造成了CPU资源的浪费，我们希望CPU能够一直工作。那么，只要让CPU在等待阶段调度其他程序上CPU即可，于是设计了抢占式调度和协作式调度。
+
+在原来的批处理系统，程序被加载到了同一个地址，所以内存中只能驻留一个程序，现在我们希望内存中能驻留多个程序，所以可以将程序加载到内存中不同的位置。
+
+教程中实现了一个脚本，为每一个应用程序定制自己的链接脚本，将程序链接到不同的地址上：
+
+```python
+import os
+
+base_address = 0x80400000
+step = 0x20000
+linker = 'src/linker.ld'
+
+app_id = 0
+apps = os.listdir('src/bin')
+apps.sort()
+for app in apps:
+    app = app[:app.find('.')]
+    lines = []
+    lines_before = []
+    with open(linker, 'r') as f:
+        for line in f.readlines():
+            lines_before.append(line)
+            line = line.replace(hex(base_address), hex(base_address+step*app_id))
+            lines.append(line)
+    with open(linker, 'w+') as f:
+        f.writelines(lines)
+    os.system('cargo build --bin %s --release' % app)
+    print('[build.py] application %s start with address %s' %(app, hex(base_address+step*app_id)))
+    with open(linker, 'w+') as f:
+        f.writelines(lines_before)
+    app_id = app_id + 1
+```
+
+除此以外，还要实现任务的切换，让占用CPU的程序交出CPU。众所周知，在抢占式调度中，系统可以采用时间片轮转调度，当一个任务在CPU上运行一个时间片，系统会强制让原先的任务上出CPU，新的任务被送上CPU运行。要知道一个时间片是否运行完毕，靠的是时钟中断，该中断由硬件发出，内核会检测到中断并处理。同样的，如果是协作式调度，则由任务自行让出CPU，也是发出中断，处理函数如下：
+
+```rust
+#[no_mangle]
+/// handle an interrupt, exception, or system call from user space
+pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
+	// ....
+    match scause.cause() {
+		// .....
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            set_next_trigger();
+            suspend_current_and_run_next(); // 切换程序
+        }
+		// .....
+    }
+    cx
+}
+```
+
+检测到中断后，就会运行 `suspend_current_and_run_next()` 切换到任务运行，系统将调用这段代码进行任务切换，：
+
+```assembly
+.altmacro
+.macro SAVE_SN n
+    sd s\n, (\n+2)*8(a0)
+.endm
+.macro LOAD_SN n
+    ld s\n, (\n+2)*8(a1)
+.endm
+    .section .text
+    .globl __switch
+__switch:
+    # __switch(
+    #     current_task_cx_ptr: *mut TaskContext,
+    #     next_task_cx_ptr: *const TaskContext
+    # )
+    # save kernel stack of current task
+    sd sp, 8(a0)
+    # save ra & s0~s11 of current execution
+    sd ra, 0(a0)
+    .set n, 0
+    .rept 12
+        SAVE_SN %n
+        .set n, n + 1
+    .endr
+    # restore ra & s0~s11 of next execution
+    ld ra, 0(a1)
+    .set n, 0
+    .rept 12
+        LOAD_SN %n
+        .set n, n + 1
+    .endr
+    # restore kernel stack of next task
+    ld sp, 8(a1)
+    ret
+```
+
+上述代码中，保存了任务的上下文，便于下次切换回任务时进行恢复，上下文结构如下：
+
+```rust
+/// Task Context
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TaskContext {
+    /// return address ( e.g. __restore ) of __switch ASM function
+    ra: usize,
+    /// kernel stack pointer of app
+    sp: usize,
+    /// callee saved registers:  s 0..11
+    s: [usize; 12],
+}
+```
+
+任务的上下文中，保存了返回地址，内核栈的栈顶和调用寄存器组。
+
+当系统启动，则启动第一个任务：
+
+```rust
+fn run_first_task(&self) -> ! {
+    let mut inner = self.inner.exclusive_access();
+    let task0 = &mut inner.tasks[0];
+    task0.task_status = TaskStatus::Running; // 设置运行态
+    let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+    drop(inner);
+    let mut _unused = TaskContext::zero_init();
+    // before this, we should drop local variables that must be dropped manually
+    unsafe {
+        // 切换到第一个任务
+        __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
+    }
+    panic!("unreachable in run_first_task!");
+}
+```
+
+切换到下一个任务运行：
+
+```rust
+fn run_next_task(&self) {
+    if let Some(next) = self.find_next_task() {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[next].task_status = TaskStatus::Running;
+        inner.current_task = next;
+        let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
+        let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+        drop(inner);
+        // before this, we should drop local variables that must be dropped manually
+        unsafe {
+            __switch(current_task_cx_ptr, next_task_cx_ptr);
+        }
+        // go back to user mode
+    } else {
+        println!("All applications completed!");
+        shutdown(false);
+    }
+}
+```
+
+到此便实现了任务切换
